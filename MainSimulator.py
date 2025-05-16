@@ -110,10 +110,6 @@ def generate_gaze_log(cluster_idx):
     except Exception as e:
         return [f"Error generating gaze log: {e}"]
 
-    
-
-
-
 # --- Tooltip Helper Class ---
 class ToolTip:
     def __init__(self, widget, text):
@@ -139,44 +135,59 @@ class ToolTip:
             self.tooltip_window.destroy()
             self.tooltip_window = None
 
-# --- Main UI Code ---
+# --- UI: Create participant panel ---
+def create_participant_panel(parent, participant_num):
+    frame = ttk.LabelFrame(parent, text=f"Participant {participant_num}", padding=(10, 5))
+    frame.pack(padx=5, pady=10, fill="x")
+
+    gaze_label = ttk.Label(frame, text="Gaze Activity")
+    gaze_label.pack(anchor="w")
+    gaze_dd = ttk.Combobox(frame, values=["1 (Low)", "2 (High)", "3 (Moderate)"], state="readonly")
+    gaze_dd.current(0)
+    gaze_dd.pack(anchor="w", fill="x")
+    ToolTip(gaze_label, "Instances count, mean/std of timestamps and duration,\nvirtual object looked at, first three non-DC Fourier frequency\ncomponents of timestamps")
+
+    loc_label = ttk.Label(frame, text="Locomotion Activity")
+    loc_label.pack(anchor="w", pady=(10, 0))
+    loc_dd = ttk.Combobox(frame, values=["1 (Consistent)", "2 (Variable)", "3 (Dynamic)", "4 (Stable)"], state="readonly")
+    loc_dd.current(0)
+    loc_dd.pack(anchor="w", fill="x")
+    ToolTip(loc_label, "Instances count, mean/std of timestamps and X, Y, Z coordinates,\nrange of X, Y, Z, total distance/time, mean/max speed and acceleration,\nmean jerk, path tortuosity, idle fraction,\nfirst three non-DC Fourier frequency components.")
+
+    speak_label = ttk.Label(frame, text="Speaking Activity")
+    speak_label.pack(anchor="w", pady=(10, 0))
+    speak_dd = ttk.Combobox(frame, values=["1 (Frequent)", "2 (Infrequent)", "3 (Moderate)"], state="readonly")
+    speak_dd.current(0)
+    speak_dd.pack(anchor="w", fill="x")
+    ToolTip(speak_label, "Instances count, mean/std of timestamps and duration,\nfirst three non-DC Fourier frequency components of timestamps")
+
+    return (gaze_dd, loc_dd, speak_dd)
+
+# --- Start simulation logic ---
 def start_simulation():
     status_label.config(text="Status: Running")
     log_text.delete(1.0, tk.END)
 
-    # Log selected options
-    gaze_label = gaze_dropdown.get()
-    loc_label = loc_dropdown.get()
-    speaking_label = speaking_dropdown.get()
-
-    log_text.insert(tk.END, f"Simulation started with:\n")
-    log_text.insert(tk.END, f"  Gaze Activity: {gaze_label}\n")
-    log_text.insert(tk.END, f"  Locomotion Activity: {loc_label}\n")
-    log_text.insert(tk.END, f"  Speaking Activity: {speaking_label}\n")
+    log_text.insert(tk.END, f"Simulation started for 4 participants:\n")
     log_text.insert(tk.END, "-"*30 + "\n")
 
-    # Extract cluster numbers (first character of dropdown, e.g. "1 (Low)" -> 1)
-    gaze_cluster = int(gaze_label.split()[0])
-    loc_cluster = int(loc_label.split()[0])
-    speaking_cluster = int(speaking_label.split()[0])
+    for idx, (gaze_dd, loc_dd, speak_dd) in enumerate(participant_dropdowns, start=1):
+        gaze_cluster = int(gaze_dd.get().split()[0]) - 1
+        loc_cluster = int(loc_dd.get().split()[0]) - 1
+        speak_cluster = int(speak_dd.get().split()[0]) - 1
 
-    # Generate logs
-    gaze_logs = generate_gaze_log(gaze_cluster)
-    loc_logs = generate_location_log(loc_cluster)
-    speaking_logs = generate_speaking_log(speaking_cluster)
+        log_text.insert(tk.END, f"\n[Participant {idx}]\n")
+        log_text.insert(tk.END, f"  Gaze Cluster: {gaze_cluster + 1}\n")
+        log_text.insert(tk.END, f"  Loc Cluster: {loc_cluster + 1}\n")
+        log_text.insert(tk.END, f"  Speaking Cluster: {speak_cluster + 1}\n")
 
-    # Show all logs
-    log_text.insert(tk.END, "\n[Gaze Log]\n")
-    for line in gaze_logs:
-        log_text.insert(tk.END, line + "\n")
+        gaze_logs = generate_gaze_log(gaze_cluster)
+        loc_logs = generate_location_log(loc_cluster)
+        speak_logs = generate_speaking_log(speak_cluster)
 
-    log_text.insert(tk.END, "\n[Locomotion Log]\n")
-    for line in loc_logs:
-        log_text.insert(tk.END, line + "\n")
-
-    log_text.insert(tk.END, "\n[Speaking Log]\n")
-    for line in speaking_logs:
-        log_text.insert(tk.END, line + "\n")
+        log_text.insert(tk.END, "\n[Gaze Log]\n" + "\n".join(gaze_logs) + "\n")
+        log_text.insert(tk.END, "\n[Locomotion Log]\n" + "\n".join(loc_logs) + "\n")
+        log_text.insert(tk.END, "\n[Speaking Log]\n" + "\n".join(speak_logs) + "\n")
 
     log_text.see(tk.END)
 
@@ -186,72 +197,53 @@ def stop_simulation():
     log_text.insert(tk.END, "-"*30 + "\n")
     log_text.see(tk.END)
 
+# --- Build the UI ---
 root = tk.Tk()
-root.title("Simulator UI")
-root.geometry("1000x600")
+root.title("Simulator UI - 4 Participants")
+root.geometry("1100x700")
 
 main_frame = ttk.Frame(root)
 main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-control_frame = ttk.Frame(main_frame)
-control_frame.pack(side="left", fill="y", padx=10, pady=10)
+# Make control panel scrollable
+control_canvas = tk.Canvas(main_frame)
+scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=control_canvas.yview)
+scrollable_control = ttk.Frame(control_canvas)
 
-label = ttk.Label(control_frame, text="Simulation Control Panel", font=("Helvetica", 16))
+scrollable_control.bind(
+    "<Configure>", lambda e: control_canvas.configure(scrollregion=control_canvas.bbox("all"))
+)
+
+control_canvas.create_window((0, 0), window=scrollable_control, anchor="nw")
+control_canvas.configure(yscrollcommand=scrollbar.set, width=400)
+
+control_canvas.pack(side="left", fill="y", expand=False)
+scrollbar.pack(side="left", fill="y")
+
+label = ttk.Label(scrollable_control, text="Simulation Control Panel", font=("Helvetica", 16))
 label.pack(pady=10)
 
-selection_frame = ttk.Frame(control_frame)
-selection_frame.pack(pady=10)
+participant_dropdowns = []
+for i in range(4):
+    dropdowns = create_participant_panel(scrollable_control, i + 1)
+    participant_dropdowns.append(dropdowns)
 
-# --- Gaze Activity ---
-gaze_label = ttk.Label(selection_frame, text="Gaze Activity")
-gaze_label.pack(anchor="w")
-ToolTip(gaze_label, "Instances count, mean/std of timestamps and duration,\nvirtual object looked at, first three non-DC Fourier frequency\ncomponents of timestamps")
-
-gaze_options = ["1 (Low)", "2 (High)", "3 (Moderate)"]
-gaze_dropdown = ttk.Combobox(selection_frame, values=gaze_options, state="readonly")
-gaze_dropdown.current(0)
-gaze_dropdown.pack(anchor="w", fill="x")
-
-# --- Locomotion Activity ---
-loc_label = ttk.Label(selection_frame, text="Locomotion Activity")
-loc_label.pack(anchor="w", pady=(10, 0))
-ToolTip(loc_label, "Instances count, mean/std of timestamps and X, Y, Z coordinates,\nrange of X, Y, Z, total distance/time, mean/max speed and acceleration,\nmean jerk, path tortuosity, idle fraction,\nfirst three non-DC Fourier frequency components.")
-
-loc_options = ["1 (Consistent)", "2 (Variable)", "3 (Dynamic)", "4 (Stable)"]
-loc_dropdown = ttk.Combobox(selection_frame, values=loc_options, state="readonly")
-loc_dropdown.current(0)
-loc_dropdown.pack(anchor="w", fill="x")
-
-# --- Speaking Activity ---
-speaking_label = ttk.Label(selection_frame, text="Speaking Activity")
-speaking_label.pack(anchor="w", pady=(10, 0))
-ToolTip(speaking_label, "Instances count, mean/std of timestamps and duration,\nfirst three non-DC Fourier frequency components of timestamps")
-
-speaking_options = ["1 (Frequent)", "2 (Infrequent)", "3 (Moderate)"]
-speaking_dropdown = ttk.Combobox(selection_frame, values=speaking_options, state="readonly")
-speaking_dropdown.current(0)
-speaking_dropdown.pack(anchor="w", fill="x")
-
-# Buttons
-start_button = ttk.Button(control_frame, text="Start Simulation", command=start_simulation)
+start_button = ttk.Button(scrollable_control, text="Start Simulation", command=start_simulation)
 start_button.pack(pady=5)
 
-stop_button = ttk.Button(control_frame, text="Stop Simulation", command=stop_simulation)
+stop_button = ttk.Button(scrollable_control, text="Stop Simulation", command=stop_simulation)
 stop_button.pack(pady=5)
 
-status_label = ttk.Label(control_frame, text="Status: Idle", font=("Helvetica", 14))
+status_label = ttk.Label(scrollable_control, text="Status: Idle", font=("Helvetica", 14))
 status_label.pack(pady=10)
 
-# Right Log Panel
 log_frame = ttk.Frame(main_frame)
 log_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
 
 log_label = ttk.Label(log_frame, text="Log Output", font=("Helvetica", 14))
 log_label.pack(anchor="w")
 
-log_text = tk.Text(log_frame, height=30, width=60)
+log_text = tk.Text(log_frame, height=30, width=70)
 log_text.pack(fill="both", expand=True)
 
 root.mainloop()
-
-
