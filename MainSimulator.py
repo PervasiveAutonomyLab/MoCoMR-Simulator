@@ -4,47 +4,132 @@ import pandas as pd
 import numpy as np
 import ast
 from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import sys
+
+def on_closing():
+    # stop the tk mainloop
+    root.quit()
+    # destroy any remaining windows
+    root.destroy()
+    # exit the Python process
+    sys.exit(0)
+
+def get_location_durations(cluster_idx):
+    df = pd.read_csv("loc_gmm_clustering_results.csv", low_memory=False)
+    df["Timestamps"] = df["Timestamps"].apply(ast.literal_eval)
+    diffs = []
+    for _, row in df[df["Cluster_GMM"] == cluster_idx].iterrows():
+        ts = row["Timestamps"]
+        diffs += [ts[i] - ts[i-1] for i in range(1, len(ts))]
+    return np.array(diffs)
+
+def get_speaking_durations(cluster_idx):
+    df = pd.read_csv("gmm_clustering_results_speaking.csv")
+    df["Start Times"] = df["Start Times"].apply(ast.literal_eval)
+    df["Durations"]   = df["Durations"].apply(ast.literal_eval)
+    durs = []
+    for _, row in df[df["Cluster_GMM"] == cluster_idx].iterrows():
+        durs += row["Durations"]
+    return np.array(durs)
+
+def get_gaze_durations(cluster_idx):
+    cluster_df = pd.read_csv("hover_gmm_user_clustering_results.csv")
+    cluster_df["Group ID"]     = cluster_df["Group ID"].astype(str)
+    cluster_df["Cluster_GMM"]  = pd.to_numeric(cluster_df["Cluster_GMM"], errors="coerce")
+    gids = cluster_df[cluster_df["Cluster_GMM"] == cluster_idx]["Group ID"].unique().tolist()
+    fft_df = pd.read_csv("hover_user_object_fft.csv")
+    fft_df["Group ID"] = fft_df["Group ID"].astype(str)
+    return np.array(
+        fft_df[fft_df["Group ID"].isin(gids)]["Mean Duration"].tolist()
+    )
+
+def show_histograms():
+    # pull cluster choices for all 4 participants
+    loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
+    speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
+    gaze_idxs  = [int(dd.get().split()[0]) - 1 for dd, _, _ in participant_dropdowns]
+
+    # 3 modalities × 4 participants
+    fig, axes = plt.subplots(
+        nrows=3, ncols=4,
+        figsize=(8, 6),
+        tight_layout=True
+    )
+
+    # (title, extractor, chosen cluster idxs)
+    modalities = [
+        ("Gaze Durations (s)",     get_gaze_durations,      gaze_idxs),
+        ("Locomotion Δt (s)",      get_location_durations,  loc_idxs),
+        ("Speaking Durations (s)", get_speaking_durations,  speak_idxs),
+    ]
+    # just the short row‐labels we want
+    row_labels = ["Gaze", "Locomotion", "Speaking"]
+
+    for row, (title, extractor, idxs) in enumerate(modalities):
+        for col, cluster_idx in enumerate(idxs):
+            ax = axes[row, col]
+            data = extractor(cluster_idx)
+            if data.size:
+                ax.hist(data, bins=20)
+
+            # only label the leftmost column with both row name & count
+            if col == 0:
+                ax.set_ylabel(f"{row_labels[row]}\nCount")
+            # only label the bottom row with the x‐axis
+            if row == 2:
+                ax.set_xlabel("Duration (s)")
+            # put participant title on the top row
+            if row == 0:
+                ax.set_title(f"P{col+1}")
+
+    # overall figure title
+    fig.suptitle("Participant Histograms", y=1.02, fontsize=14)
+
+    # embed into Tk window
+    win = tk.Toplevel(root)
+    win.title("Participant Histograms")
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
 
 
 def generate_location_log(cluster_idx):
     """
-    Simulates location movement logs based on cluster index from loc_gmm_clustering_results.csv.
-    Returns a list of log strings.
+    Logs every real Δt (and associated X,Y,Z) for the given cluster,
+    instead of drawing only 10 synthetic samples.
     """
     try:
         df = pd.read_csv("loc_gmm_clustering_results.csv", low_memory=False)
+        # turn the strings back into lists
         df["Timestamps"] = df["Timestamps"].apply(ast.literal_eval)
         df["X"] = df["X"].apply(ast.literal_eval)
         df["Y"] = df["Y"].apply(ast.literal_eval)
         df["Z"] = df["Z"].apply(ast.literal_eval)
-        cluster_df = df[df["Cluster_GMM"] == cluster_idx]
-        diff_list = []
 
+        cluster_df = df[df["Cluster_GMM"] == cluster_idx]
+        if cluster_df.empty:
+            return [f"No movement data available for cluster {cluster_idx}."]
+        
+        logs = []
+        base_time = datetime.now()
+        # for every row in that cluster, walk through its real timestamps
         for _, row in cluster_df.iterrows():
             ts, xs, ys, zs = row["Timestamps"], row["X"], row["Y"], row["Z"]
             for i in range(1, len(ts)):
-                diff_list.append([ts[i]-ts[i-1], xs[i]-xs[i-1], ys[i]-ys[i-1], zs[i]-zs[i-1]])
-        
-        if not diff_list:
-            return ["No movement data available for this cluster."]
-
-        diff_array = np.array(diff_list)
-        mean_diff = np.mean(diff_array, axis=0)
-        cov_diff = np.cov(diff_array.T)
-        synthetic_diffs = np.random.multivariate_normal(mean_diff, cov_diff, size=10)
-        logs, ts, x, y, z = [], [0], [0], [0], [0]
-
-        for dt, dx, dy, dz in synthetic_diffs:
-            ts.append(ts[-1]+dt)
-            x.append(x[-1]+dx)
-            y.append(y[-1]+dy)
-            z.append(z[-1]+dz)
-
-        base_time = datetime.now()
-        for t, xi, yi, zi in zip(ts, x, y, z):
-            time_str = (base_time + timedelta(seconds=t)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            logs.append(f"{time_str}: Position - X: {xi:.2f}, Y: {yi:.2f}, Z: {zi:.2f}")
+                dt = ts[i] - ts[i-1]
+                xi, yi, zi = xs[i], ys[i], zs[i]
+                # stamp it in real time for readability
+                time_str = (base_time + timedelta(seconds=ts[i])) \
+                            .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                logs.append(
+                    f"{time_str}: Position - "
+                    f"X: {xi:.2f}, Y: {yi:.2f}, Z: {zi:.2f} | "
+                    f"Duration: {dt:.2f}s"
+                )
         return logs
+
     except Exception as e:
         return [f"Error generating location log: {e}"]
     
@@ -56,18 +141,20 @@ def generate_speaking_log(cluster_idx):
     """
     try:
         df = pd.read_csv("gmm_clustering_results_speaking.csv")
-        df.columns = df.columns.str.strip()  # Strip spaces just in case
+        df.columns = df.columns.str.strip()
         df["Start Times"] = df["Start Times"].apply(ast.literal_eval)
+        df["Durations"] = df["Durations"].apply(ast.literal_eval)
         cluster_df = df[df["Cluster_GMM"] == cluster_idx]
-        if cluster_df.empty:
-            return ["No speaking data available for this cluster."]
-        
+
         log_lines = []
         for _, row in cluster_df.iterrows():
-            for ts in row["Start Times"]:
+            starts = row["Start Times"]
+            durs = row["Durations"]
+            for ts, dur in zip(starts, durs):
                 time_str = (datetime.now() + timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M:%S")
-                log_lines.append(f"{time_str}: Speaking Event")
-        return log_lines or ["No timestamps found in speaking cluster."]
+                log_lines.append(f"{time_str}: Speaking Event lasted {dur:.2f} seconds")
+
+        return log_lines or ["No speaking durations found for cluster."]
     except Exception as e:
         return [f"Error generating speaking log: {e}"]
     
@@ -101,9 +188,9 @@ def generate_gaze_log(cluster_idx):
             obj = row["Virtual Object"]
             duration = row["Mean Duration"]
             start_offset = row["Mean Start Time"]
-            fft = [row["FFT1"], row["FFT2"], row["FFT3"]]
+            #fft = [row["FFT1"], row["FFT2"], row["FFT3"]]
             time_str = (datetime.now() + timedelta(seconds=start_offset)).strftime("%Y-%m-%d %H:%M:%S")
-            log_lines.append(f"{time_str}: Gazed at {obj} for {duration:.2f}s | FFTs: {fft}")
+            log_lines.append(f"{time_str}: Gazed at {obj} for {duration:.2f}s")
 
         return log_lines
 
@@ -237,6 +324,10 @@ stop_button.pack(pady=5)
 status_label = ttk.Label(scrollable_control, text="Status: Idle", font=("Helvetica", 14))
 status_label.pack(pady=10)
 
+hist_button = ttk.Button(scrollable_control,text="Show Histograms",command=show_histograms)
+hist_button.pack(pady=5)
+
+
 log_frame = ttk.Frame(main_frame)
 log_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
 
@@ -245,5 +336,7 @@ log_label.pack(anchor="w")
 
 log_text = tk.Text(log_frame, height=30, width=70)
 log_text.pack(fill="both", expand=True)
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
 
 root.mainloop()
