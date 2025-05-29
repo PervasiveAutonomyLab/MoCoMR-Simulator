@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sys
+import re
+from numpy.random import multivariate_normal
+
 
 def on_closing():
     # stop the tk mainloop
@@ -45,7 +48,7 @@ def get_gaze_durations(cluster_idx):
         fft_df[fft_df["Group ID"].isin(gids)]["Mean Duration"].tolist()
     )
 
-def show_histograms():
+def show_histograms_raw():
     # pull cluster choices for all 4 participants
     loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
     speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
@@ -85,9 +88,60 @@ def show_histograms():
                 ax.set_title(f"P{col+1}")
 
     # overall figure title
-    fig.suptitle("Participant Histograms", y=1.02, fontsize=14)
+    fig.suptitle("raw Histograms", y=1.02, fontsize=14)
 
     # embed into Tk window
+    win = tk.Toplevel(root)
+    win.title("raw Histograms")
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+
+def show_histograms_user():
+    # pull cluster choices for all 4 participants
+    loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
+    speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
+    gaze_idxs  = [int(dd.get().split()[0]) - 1 for dd, _, _ in participant_dropdowns]
+
+    fig, axes = plt.subplots(3, 4, figsize=(8, 6), tight_layout=True)
+
+    # now pair each row with the *generator* instead of the CSV‐getter
+    modalities = [
+        ("Gaze Durations (s)",     generate_gaze_log,     gaze_idxs),
+        ("Locomotion Δt (s)",      generate_location_log, loc_idxs),
+        ("Speaking Durations (s)", generate_speaking_log, speak_idxs),
+    ]
+    row_labels = ["Gaze", "Locomotion", "Speaking"]
+
+    for row, (title, generator, idxs) in enumerate(modalities):
+        for col, cluster_idx in enumerate(idxs):
+            ax = axes[row, col]
+
+            # 1) get the raw log‐lines
+            logs = generator(cluster_idx)
+
+            # 2) pull out any float immediately before 's' (for gaze & loco) or ' seconds'
+            durations = []
+            for line in logs:
+                m = re.search(r'([\d\.]+)(?=s\b)', line) or \
+                    re.search(r'([\d\.]+)(?= seconds\b)', line)
+                if m:
+                    durations.append(float(m.group(1)))
+
+            # 3) plot exactly as before
+            if durations:
+                ax.hist(durations, bins=20)
+
+            # axis‐label logic unchanged
+            if col == 0:
+                ax.set_ylabel(f"{row_labels[row]}\nCount")
+            if row == 2:
+                ax.set_xlabel("Duration (s)")
+            if row == 0:
+                ax.set_title(f"P{col+1}")
+
+    fig.suptitle("Participant Histograms", y=1.02, fontsize=14)
+
     win = tk.Toplevel(root)
     win.title("Participant Histograms")
     canvas = FigureCanvasTkAgg(fig, master=win)
@@ -95,14 +149,10 @@ def show_histograms():
     canvas.get_tk_widget().pack(fill="both", expand=True)
 
 
+
 def generate_location_log(cluster_idx):
-    """
-    Logs every real Δt (and associated X,Y,Z) for the given cluster,
-    instead of drawing only 10 synthetic samples.
-    """
     try:
         df = pd.read_csv("loc_gmm_clustering_results.csv", low_memory=False)
-        # turn the strings back into lists
         df["Timestamps"] = df["Timestamps"].apply(ast.literal_eval)
         df["X"] = df["X"].apply(ast.literal_eval)
         df["Y"] = df["Y"].apply(ast.literal_eval)
@@ -111,23 +161,39 @@ def generate_location_log(cluster_idx):
         cluster_df = df[df["Cluster_GMM"] == cluster_idx]
         if cluster_df.empty:
             return [f"No movement data available for cluster {cluster_idx}."]
-        
-        logs = []
-        base_time = datetime.now()
-        # for every row in that cluster, walk through its real timestamps
+
+        # Model delta values (dt, dx, dy, dz)
+        deltas = []
         for _, row in cluster_df.iterrows():
             ts, xs, ys, zs = row["Timestamps"], row["X"], row["Y"], row["Z"]
             for i in range(1, len(ts)):
                 dt = ts[i] - ts[i-1]
-                xi, yi, zi = xs[i], ys[i], zs[i]
-                # stamp it in real time for readability
-                time_str = (base_time + timedelta(seconds=ts[i])) \
-                            .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                logs.append(
-                    f"{time_str}: Position - "
-                    f"X: {xi:.2f}, Y: {yi:.2f}, Z: {zi:.2f} | "
-                    f"Duration: {dt:.2f}s"
-                )
+                dx = xs[i] - xs[i-1]
+                dy = ys[i] - ys[i-1]
+                dz = zs[i] - zs[i-1]
+                deltas.append([dt, dx, dy, dz])
+
+        deltas = np.array(deltas)
+        if deltas.shape[0] < 2:
+            return [f"Not enough data to model movement for cluster {cluster_idx}."]
+        
+        mean = np.mean(deltas, axis=0)
+        cov = np.cov(deltas.T)
+
+        samples = np.random.multivariate_normal(mean, cov,  size=len(deltas))
+        base_time = datetime.now()
+        t = 0
+        x, y, z = 0.0, 0.0, 0.0
+        logs = []
+
+        for dt, dx, dy, dz in samples:
+            t += max(dt, 0.01)
+            x += dx
+            y += dy
+            z += dz
+            time_str = (base_time + timedelta(seconds=t)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            logs.append(f"{time_str}: Position - X: {x:.2f}, Y: {y:.2f}, Z: {z:.2f} | Duration: {max(dt,0):.2f}s")
+
         return logs
 
     except Exception as e:
@@ -135,68 +201,88 @@ def generate_location_log(cluster_idx):
     
 
 def generate_speaking_log(cluster_idx):
-    """
-    Simulates speaking logs based on gmm_clustering_results_speaking.csv.
-    Returns a list of log strings.
-    """
     try:
         df = pd.read_csv("gmm_clustering_results_speaking.csv")
-        df.columns = df.columns.str.strip()
         df["Start Times"] = df["Start Times"].apply(ast.literal_eval)
         df["Durations"] = df["Durations"].apply(ast.literal_eval)
         cluster_df = df[df["Cluster_GMM"] == cluster_idx]
+        if cluster_df.empty:
+            return [f"No speaking data available for cluster {cluster_idx}."]
 
-        log_lines = []
+        all_starts = []
+        all_durs = []
         for _, row in cluster_df.iterrows():
-            starts = row["Start Times"]
-            durs = row["Durations"]
-            for ts, dur in zip(starts, durs):
-                time_str = (datetime.now() + timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M:%S")
-                log_lines.append(f"{time_str}: Speaking Event lasted {dur:.2f} seconds")
+            all_starts += row["Start Times"]
+            all_durs += row["Durations"]
 
-        return log_lines or ["No speaking durations found for cluster."]
+        if not all_starts or not all_durs:
+            return [f"No valid speaking events in cluster {cluster_idx}."]
+
+        # histogram + fft smoothing
+        start_hist, edges = np.histogram(all_starts, bins='auto', density=True)
+        start_smoothed = np.fft.irfft(np.fft.rfft(start_hist)[:4], n=len(start_hist))
+        start_probs = np.maximum(start_smoothed, 0)
+        start_probs /= start_probs.sum()
+        start_bins = (edges[:-1] + edges[1:]) / 2
+        sampled_starts = np.random.choice(start_bins, size=len(all_starts), p=start_probs)
+
+        dur_hist, edges = np.histogram(all_durs, bins='auto', density=True)
+        dur_smoothed = np.fft.irfft(np.fft.rfft(dur_hist)[:4], n=len(dur_hist))
+        dur_probs = np.maximum(dur_smoothed, 0)
+        dur_probs /= dur_probs.sum()
+        dur_bins = (edges[:-1] + edges[1:]) / 2
+        sampled_durs = np.random.choice(dur_bins, size=len(all_durs), p=dur_probs)
+
+        base_time = datetime.now()
+        logs = []
+        for ts, dur in zip(sampled_starts, sampled_durs):
+            time_str = (base_time + timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M:%S")
+            logs.append(f"{time_str}: Speaking Event lasted {dur:.2f} seconds")
+        return logs
     except Exception as e:
         return [f"Error generating speaking log: {e}"]
     
 
 def generate_gaze_log(cluster_idx):
     try:
-        # Load cluster mapping
         cluster_df = pd.read_csv("hover_gmm_user_clustering_results.csv")
-        cluster_df.columns = cluster_df.columns.str.strip()
         cluster_df["Group ID"] = cluster_df["Group ID"].astype(str)
         cluster_df["Cluster_GMM"] = pd.to_numeric(cluster_df["Cluster_GMM"], errors="coerce")
-
-        # Filter Group IDs that match the selected cluster
         group_ids = cluster_df[cluster_df["Cluster_GMM"] == cluster_idx]["Group ID"].unique()
 
         if len(group_ids) == 0:
             return [f"No gaze groups found for cluster {cluster_idx}."]
 
-        # Load gaze features
         fft_df = pd.read_csv("hover_user_object_fft.csv")
-        fft_df.columns = fft_df.columns.str.strip()
         fft_df["Group ID"] = fft_df["Group ID"].astype(str)
-
-        # Filter rows from fft_df matching selected group_ids
         filtered = fft_df[fft_df["Group ID"].isin(group_ids)]
         if filtered.empty:
             return [f"No gaze data available for cluster {cluster_idx}."]
 
-        log_lines = []
+        logs = []
+        base_time = datetime.now()
         for _, row in filtered.iterrows():
+            duration_fft = [row.get(k, 0) for k in ["DC", "FFT1", "FFT2", "FFT3"]]
+            if not all(np.isfinite(duration_fft)):
+                continue
+
+            # synthesize duration curve
+            duration_wave = np.fft.irfft(duration_fft, n=32)
+            duration_wave = np.maximum(duration_wave, 0)  # clamp negatives
+            duration_wave /= duration_wave.sum()  # normalize
+            durations = np.random.choice(np.linspace(1, 5, 32), p=duration_wave, size=1)
+
             obj = row["Virtual Object"]
-            duration = row["Mean Duration"]
-            start_offset = row["Mean Start Time"]
-            #fft = [row["FFT1"], row["FFT2"], row["FFT3"]]
-            time_str = (datetime.now() + timedelta(seconds=start_offset)).strftime("%Y-%m-%d %H:%M:%S")
-            log_lines.append(f"{time_str}: Gazed at {obj} for {duration:.2f}s")
-
-        return log_lines
-
+            offset = float(row["Mean Start Time"])
+            for d in durations:
+                t = base_time + timedelta(seconds=offset)
+                logs.append(f"{t.strftime('%Y-%m-%d %H:%M:%S')}: Gazed at {obj} for {d:.2f}s")
+        return logs
     except Exception as e:
         return [f"Error generating gaze log: {e}"]
+    
 
+    
 # --- Tooltip Helper Class ---
 class ToolTip:
     def __init__(self, widget, text):
@@ -324,9 +410,11 @@ stop_button.pack(pady=5)
 status_label = ttk.Label(scrollable_control, text="Status: Idle", font=("Helvetica", 14))
 status_label.pack(pady=10)
 
-hist_button = ttk.Button(scrollable_control,text="Show Histograms",command=show_histograms)
-hist_button.pack(pady=5)
+raw_button = ttk.Button(scrollable_control,text="Show Raw Histograms",command=show_histograms_raw)
+raw_button.pack(pady=5)
 
+log_button = ttk.Button(scrollable_control,text="Show Log-based Histograms",command=show_histograms_user)
+log_button.pack(pady=5)
 
 log_frame = ttk.Frame(main_frame)
 log_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
