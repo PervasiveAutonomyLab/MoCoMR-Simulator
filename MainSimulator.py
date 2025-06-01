@@ -9,6 +9,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sys
 import re
 from numpy.random import multivariate_normal
+from scipy.stats import gaussian_kde
 
 
 def on_closing():
@@ -245,6 +246,7 @@ def generate_speaking_log(cluster_idx):
 
 def generate_gaze_log(cluster_idx):
     try:
+        # Load cluster info
         cluster_df = pd.read_csv("hover_gmm_user_clustering_results.csv")
         cluster_df["Group ID"] = cluster_df["Group ID"].astype(str)
         cluster_df["Cluster_GMM"] = pd.to_numeric(cluster_df["Cluster_GMM"], errors="coerce")
@@ -253,31 +255,35 @@ def generate_gaze_log(cluster_idx):
         if len(group_ids) == 0:
             return [f"No gaze groups found for cluster {cluster_idx}."]
 
+        # Load FFT durations
         fft_df = pd.read_csv("hover_user_object_fft.csv")
         fft_df["Group ID"] = fft_df["Group ID"].astype(str)
         filtered = fft_df[fft_df["Group ID"].isin(group_ids)]
-        if filtered.empty:
-            return [f"No gaze data available for cluster {cluster_idx}."]
+        durations = filtered["Mean Duration"].dropna().to_numpy()
 
-        logs = []
+        # Hard limit to match true data distribution shape
+        durations = durations[(durations > 0.01) & (durations < 0.6)]
+        if len(durations) < 20:
+            return [f"Not enough valid gaze durations for cluster {cluster_idx}."]
+
+        # Build KDE model
+        kde = gaussian_kde(durations)
+        xs = np.linspace(0.01, 0.6, 500)
+        probs = kde(xs)
+        probs = np.maximum(probs, 0)
+        probs /= probs.sum()
+
+        # Sample from KDE
+        sampled_durations = np.random.choice(xs, size=len(durations), p=probs)
+
+        # Format into logs with timestamps
         base_time = datetime.now()
-        for _, row in filtered.iterrows():
-            duration_fft = [row.get(k, 0) for k in ["DC", "FFT1", "FFT2", "FFT3"]]
-            if not all(np.isfinite(duration_fft)):
-                continue
-
-            # synthesize duration curve
-            duration_wave = np.fft.irfft(duration_fft, n=32)
-            duration_wave = np.maximum(duration_wave, 0)  # clamp negatives
-            duration_wave /= duration_wave.sum()  # normalize
-            durations = np.random.choice(np.linspace(1, 5, 32), p=duration_wave, size=1)
-
-            obj = row["Virtual Object"]
-            offset = float(row["Mean Start Time"])
-            for d in durations:
-                t = base_time + timedelta(seconds=offset)
-                logs.append(f"{t.strftime('%Y-%m-%d %H:%M:%S')}: Gazed at {obj} for {d:.2f}s")
+        logs = []
+        for i, dur in enumerate(sampled_durations):
+            time_str = (base_time + timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            logs.append(f"{time_str}: Gazed at object for {dur:.2f}s")
         return logs
+
     except Exception as e:
         return [f"Error generating gaze log: {e}"]
     
