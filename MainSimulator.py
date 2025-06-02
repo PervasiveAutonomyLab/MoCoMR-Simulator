@@ -207,19 +207,15 @@ def generate_speaking_log(cluster_idx):
         df["Start Times"] = df["Start Times"].apply(ast.literal_eval)
         df["Durations"] = df["Durations"].apply(ast.literal_eval)
         cluster_df = df[df["Cluster_GMM"] == cluster_idx]
-        if cluster_df.empty:
-            return [f"No speaking data available for cluster {cluster_idx}."]
 
-        all_starts = []
-        all_durs = []
+        all_starts, all_durs = [], []
         for _, row in cluster_df.iterrows():
             all_starts += row["Start Times"]
             all_durs += row["Durations"]
 
         if not all_starts or not all_durs:
-            return [f"No valid speaking events in cluster {cluster_idx}."]
+            return [f"No valid speaking data for cluster {cluster_idx}."]
 
-        # histogram + fft smoothing
         start_hist, edges = np.histogram(all_starts, bins='auto', density=True)
         start_smoothed = np.fft.irfft(np.fft.rfft(start_hist)[:4], n=len(start_hist))
         start_probs = np.maximum(start_smoothed, 0)
@@ -227,12 +223,17 @@ def generate_speaking_log(cluster_idx):
         start_bins = (edges[:-1] + edges[1:]) / 2
         sampled_starts = np.random.choice(start_bins, size=len(all_starts), p=start_probs)
 
-        dur_hist, edges = np.histogram(all_durs, bins='auto', density=True)
-        dur_smoothed = np.fft.irfft(np.fft.rfft(dur_hist)[:4], n=len(dur_hist))
-        dur_probs = np.maximum(dur_smoothed, 0)
-        dur_probs /= dur_probs.sum()
-        dur_bins = (edges[:-1] + edges[1:]) / 2
-        sampled_durs = np.random.choice(dur_bins, size=len(all_durs), p=dur_probs)
+        durs = np.array(all_durs)
+        durs = durs[(durs > 0.01) & (durs < 10)]
+        if len(durs) < 10:
+            return [f"Not enough valid durations in cluster {cluster_idx}."]
+
+        xs = np.linspace(0.01, 10.0, 500)
+        kde = gaussian_kde(durs)
+        probs = kde(xs)
+        probs = np.maximum(probs, 0)
+        probs /= probs.sum()
+        sampled_durs = np.random.choice(xs, size=len(durs), p=probs)
 
         base_time = datetime.now()
         logs = []
@@ -240,8 +241,10 @@ def generate_speaking_log(cluster_idx):
             time_str = (base_time + timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M:%S")
             logs.append(f"{time_str}: Speaking Event lasted {dur:.2f} seconds")
         return logs
+
     except Exception as e:
         return [f"Error generating speaking log: {e}"]
+
     
 
 def generate_gaze_log(cluster_idx):
