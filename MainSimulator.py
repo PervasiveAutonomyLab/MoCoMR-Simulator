@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sys
 import re
+import networkx as nx
 from numpy.random import multivariate_normal
 from scipy.stats import gaussian_kde
 
@@ -145,6 +146,129 @@ def show_histograms_user():
 
     win = tk.Toplevel(root)
     win.title("Participant Histograms")
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+
+def show_sociograms():
+    # 1) Get selected clusters
+    loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
+    speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
+    gaze_idxs  = [int(dd.get().split()[0]) - 1 for dd, _, _ in participant_dropdowns]
+
+    # 2) Helpers
+    def parse_intervals(logs, pattern, time_fmt="%Y-%m-%d %H:%M:%S"):
+        ivals = []
+        for line in logs:
+            m = re.match(pattern, line)
+            if not m:
+                continue
+            ts, d = m.groups()
+            st = datetime.strptime(ts, time_fmt)
+            ivals.append((st, st + timedelta(seconds=float(d))))
+        return ivals
+
+    def overlap(a, b):
+        total = 0
+        for s1,e1 in a:
+            for s2,e2 in b:
+                dt = (min(e1,e2) - max(s1,s2)).total_seconds()
+                if dt > 0:
+                    total += dt
+        return total
+
+    # 3) Fixed positions
+    pos = {"P1":(0,1),"P2":(1,1),"P3":(0,0),"P4":(1,0)}
+
+    graphs, colors, titles = [], [], []
+
+    # --- Gaze (undirected) ---
+    G = nx.Graph(); G.add_nodes_from(pos)
+    gaze_events = [
+        parse_intervals(generate_gaze_log(i),
+                        r"(.+?): Gazed at object for ([\d\.]+)s")
+        for i in gaze_idxs
+    ]
+    for i in range(4):
+        for j in range(i+1,4):
+            w = overlap(gaze_events[i], gaze_events[j])
+            if w>0:
+                G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
+    graphs.append(G); colors.append("blue"); titles.append("Gaze Sociogram")
+
+    # --- Locomotion (directed) ---
+    G = nx.DiGraph(); G.add_nodes_from(pos)
+    loco_events = []
+    loc_pattern = r"(.+?): Position - X: ([\d\.]+), Y: ([\d\.]+), Z: ([\d\.]+) \| Duration: ([\d\.]+)s"
+    for idx in loc_idxs:
+        evs = []
+        for line in generate_location_log(idx):
+            m = re.match(loc_pattern, line)
+            if not m:
+                continue
+            ts, x, y, z, d = m.groups()
+            evs.append((
+                datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f"),
+                np.array([float(x), float(y), float(z)]),
+                float(d)
+            ))
+        loco_events.append(evs)
+
+    THRESHOLD = 1.5
+    for i in range(4):
+        for j in range(4):
+            if i==j: continue
+            tot = 0
+            for t_i, pos_i, dt in loco_events[i]:
+                t_j, pos_j, _ = min(
+                    loco_events[j],
+                    key=lambda e: abs((e[0]-t_i).total_seconds())
+                )
+                if np.linalg.norm(pos_i-pos_j) <= THRESHOLD:
+                    tot += dt
+            if tot>0:
+                G.add_edge(f"P{i+1}", f"P{j+1}", weight=tot)
+    graphs.append(G); colors.append("green"); titles.append("Locomotion Sociogram")
+
+    # --- Speaking (directed) ---
+    G = nx.DiGraph(); G.add_nodes_from(pos)
+    speak_events = [
+        parse_intervals(generate_speaking_log(i),
+                        r"(.+?): Speaking Event lasted ([\d\.]+) seconds")
+        for i in speak_idxs
+    ]
+    for i in range(4):
+        for j in range(4):
+            if i==j: continue
+            w = overlap(speak_events[i], speak_events[j])
+            if w>0:
+                G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
+    graphs.append(G); colors.append("red"); titles.append("Speaking Sociogram")
+
+    # 4) Plot
+    fig, axes = plt.subplots(1,3,figsize=(12,4))
+    for ax, G, c, t in zip(axes, graphs, colors, titles):
+        ax.set_title(t); ax.axis("off")
+        ws = [d["weight"] for _,_,d in G.edges(data=True)]
+        mx = max(ws) if ws else 1
+        widths = [1 + 4*(w/mx) for w in ws]
+
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_size=600, node_color="lightblue")
+        nx.draw_networkx_labels(G, pos, ax=ax)
+
+        if t=="Gaze Sociogram":
+            nx.draw_networkx_edges(G, pos, ax=ax, width=widths, edge_color=c)
+        else:
+            nx.draw_networkx_edges(
+                G, pos, ax=ax,
+                arrowstyle="-|>", arrowsize=12,
+                edge_color=c, width=widths,
+                connectionstyle="arc3,rad=0.15"
+            )
+
+    # 5) Show in Tk popup
+    win = tk.Toplevel(root)
+    win.title("Sociograms")
     canvas = FigureCanvasTkAgg(fig, master=win)
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -424,6 +548,9 @@ raw_button.pack(pady=5)
 
 log_button = ttk.Button(scrollable_control,text="Show Log-based Histograms",command=show_histograms_user)
 log_button.pack(pady=5)
+
+socio_button = ttk.Button(scrollable_control,text="Show Sociograms",command=show_sociograms)
+socio_button.pack(pady=5)
 
 log_frame = ttk.Frame(main_frame)
 log_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
