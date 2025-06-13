@@ -11,6 +11,12 @@ import re
 import networkx as nx
 from numpy.random import multivariate_normal
 from scipy.stats import gaussian_kde
+from matplotlib.lines import Line2D
+from matplotlib.patches import FancyArrowPatch
+
+
+
+last_sim_logs = []
 
 
 def on_closing():
@@ -152,17 +158,25 @@ def show_histograms_user():
 
 def show_sociograms():
     # 1) Get selected clusters
-    loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
-    speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
-    gaze_idxs  = [int(dd.get().split()[0]) - 1 for dd, _, _ in participant_dropdowns]
+    #loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
+    #speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
+    #gaze_idxs  = [int(dd.get().split()[0]) - 1 for dd, _, _ in participant_dropdowns]
+
+    if not last_sim_logs:
+        tk.messagebox.showwarning("No data", "Please run the simulation first.")
+        return
+
+    # We ignore cluster‐dropdowns here since we cache per‐participant
+    gaze_logs_list  = [p["gaze"]  for p in last_sim_logs]
+    loco_logs_list  = [p["loc"]   for p in last_sim_logs]
+    speak_logs_list = [p["speak"] for p in last_sim_logs]
 
     # 2) Helpers
     def parse_intervals(logs, pattern, time_fmt="%Y-%m-%d %H:%M:%S"):
         ivals = []
         for line in logs:
             m = re.match(pattern, line)
-            if not m:
-                continue
+            if not m: continue
             ts, d = m.groups()
             st = datetime.strptime(ts, time_fmt)
             ivals.append((st, st + timedelta(seconds=float(d))))
@@ -173,105 +187,140 @@ def show_sociograms():
         for s1,e1 in a:
             for s2,e2 in b:
                 dt = (min(e1,e2) - max(s1,s2)).total_seconds()
-                if dt > 0:
-                    total += dt
+                if dt>0: total += dt
         return total
 
-    # 3) Fixed positions
+    # 3) Fixed node positions
     pos = {"P1":(0,1),"P2":(1,1),"P3":(0,0),"P4":(1,0)}
 
+    # 4) Build the three graphs
     graphs, colors, titles = [], [], []
 
-    # --- Gaze (undirected) ---
+    # Gaze (undirected)
     G = nx.Graph(); G.add_nodes_from(pos)
     gaze_events = [
-        parse_intervals(generate_gaze_log(i),
-                        r"(.+?): Gazed at object for ([\d\.]+)s")
-        for i in gaze_idxs
+      parse_intervals(gaze_logs_list[i], r"(.+?): Gazed at object for ([\d\.]+)s")
+      for i in range(4)
     ]
     for i in range(4):
         for j in range(i+1,4):
             w = overlap(gaze_events[i], gaze_events[j])
-            if w>0:
-                G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
+            if w>0: G.add_edge(f"P{i+1}",f"P{j+1}", weight=w)
     graphs.append(G); colors.append("blue"); titles.append("Gaze Sociogram")
 
-    # --- Locomotion (directed) ---
-    G = nx.DiGraph(); G.add_nodes_from(pos)
+    # Locomotion undirected)
+    G = nx.Graph(); G.add_nodes_from(pos)
     loco_events = []
-    loc_pattern = r"(.+?): Position - X: ([\d\.]+), Y: ([\d\.]+), Z: ([\d\.]+) \| Duration: ([\d\.]+)s"
-    for idx in loc_idxs:
-        evs = []
-        for line in generate_location_log(idx):
-            m = re.match(loc_pattern, line)
-            if not m:
-                continue
-            ts, x, y, z, d = m.groups()
-            evs.append((
-                datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f"),
-                np.array([float(x), float(y), float(z)]),
-                float(d)
-            ))
+    loc_pat = r"(.+?): Position - X: ([\d\.]+), Y: ([\d\.]+), Z: ([\d\.]+) \| Duration: ([\d\.]+)s"
+    for i in range(4):
+        evs=[]
+        for line in loco_logs_list[i]:
+            m = re.match(loc_pat, line)
+            if not m: continue
+            ts,x,y,z,d = m.groups()
+            evs.append((datetime.strptime(ts,"%Y-%m-%d %H:%M:%S.%f"),
+                        np.array([float(x),float(y),float(z)]),
+                        float(d)))
         loco_events.append(evs)
 
-    THRESHOLD = 1.5
+    TH=1.5
     for i in range(4):
-        for j in range(4):
-            if i==j: continue
-            tot = 0
-            for t_i, pos_i, dt in loco_events[i]:
-                t_j, pos_j, _ = min(
-                    loco_events[j],
-                    key=lambda e: abs((e[0]-t_i).total_seconds())
-                )
-                if np.linalg.norm(pos_i-pos_j) <= THRESHOLD:
-                    tot += dt
-            if tot>0:
-                G.add_edge(f"P{i+1}", f"P{j+1}", weight=tot)
+        for j in range(i + 1, 4):
+            if not loco_events[i] or not loco_events[j]:
+                continue
+            
+            tot=0.0
+            for ti,pi,dt in loco_events[i]:
+                tj,pj,_ = min(loco_events[j], key=lambda e: abs((e[0]-ti).total_seconds()))
+                if np.linalg.norm(pi-pj)<=TH:
+                    tot+=dt
+            if tot>0: G.add_edge(f"P{i+1}",f"P{j+1}", weight=tot)
     graphs.append(G); colors.append("green"); titles.append("Locomotion Sociogram")
 
-    # --- Speaking (directed) ---
+    # Speaking (directed)
     G = nx.DiGraph(); G.add_nodes_from(pos)
     speak_events = [
-        parse_intervals(generate_speaking_log(i),
-                        r"(.+?): Speaking Event lasted ([\d\.]+) seconds")
-        for i in speak_idxs
+      parse_intervals(speak_logs_list[i], r"(.+?): Speaking Event lasted ([\d\.]+) seconds")
+      for i in range(4)
     ]
     for i in range(4):
         for j in range(4):
             if i==j: continue
             w = overlap(speak_events[i], speak_events[j])
-            if w>0:
-                G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
+            if w>0: G.add_edge(f"P{i+1}",f"P{j+1}", weight=w)
     graphs.append(G); colors.append("red"); titles.append("Speaking Sociogram")
 
-    # 4) Plot
+    # 5) Plot & keep per-edge artists
     fig, axes = plt.subplots(1,3,figsize=(12,4))
-    for ax, G, c, t in zip(axes, graphs, colors, titles):
-        ax.set_title(t); ax.axis("off")
-        ws = [d["weight"] for _,_,d in G.edges(data=True)]
-        mx = max(ws) if ws else 1
-        widths = [1 + 4*(w/mx) for w in ws]
+    edge_artists = []   # list of lists per axis
+    edge_weights = []
 
+    for ax, G, c, title in zip(axes, graphs, colors, titles):
+        ax.set_title(title); ax.axis("off")
         nx.draw_networkx_nodes(G, pos, ax=ax, node_size=600, node_color="lightblue")
         nx.draw_networkx_labels(G, pos, ax=ax)
 
-        if t=="Gaze Sociogram":
-            nx.draw_networkx_edges(G, pos, ax=ax, width=widths, edge_color=c)
-        else:
-            nx.draw_networkx_edges(
-                G, pos, ax=ax,
-                arrowstyle="-|>", arrowsize=12,
-                edge_color=c, width=widths,
-                connectionstyle="arc3,rad=0.15"
-            )
+        # normalize widths
+        ws = [d["weight"] for _,_,d in G.edges(data=True)]
+        mx = max(ws) if ws else 1
 
-    # 5) Show in Tk popup
+        arts, wts = [], []
+        for u,v,d in G.edges(data=True):
+            w = d["weight"]
+            width = 1 + 4*(w/mx)
+            if title=="Gaze Sociogram":
+                line = Line2D([pos[u][0],pos[v][0]],
+                              [pos[u][1],pos[v][1]],
+                              linewidth=width, color=c, picker=5)
+                ax.add_line(line)
+                arts.append(line)
+            else:
+                arr = FancyArrowPatch(pos[u], pos[v],
+                                     arrowstyle='-|>',
+                                     connectionstyle='arc3,rad=0.15',
+                                     mutation_scale=12,
+                                     linewidth=width, color=c,
+                                     picker=5)
+                ax.add_patch(arr)
+                arts.append(arr)
+            wts.append(w)
+
+        edge_artists.append(arts)
+        edge_weights.append(wts)
+
+    # 6) Hover tooltips
+    def on_move(event):
+        for ax, arts, wts in zip(axes, edge_artists, edge_weights):
+            if event.inaxes is not ax:
+                if hasattr(ax, 'tooltip'):
+                    ax.tooltip.remove(); del ax.tooltip
+                continue
+            hit = False
+            for art, w in zip(arts, wts):
+                cont, _ = art.contains(event)
+                if cont:
+                    if hasattr(ax,'tooltip'):
+                        ax.tooltip.remove()
+                    ax.tooltip = ax.annotate(f"{w:.1f}s",
+                                             xy=(event.xdata, event.ydata),
+                                             xytext=(5,5),
+                                             textcoords='offset points',
+                                             bbox=dict(boxstyle='round,pad=0.2',
+                                                       fc='yellow',alpha=0.7))
+                    fig.canvas.draw_idle()
+                    hit = True
+                    break
+            if not hit and hasattr(ax,'tooltip'):
+                ax.tooltip.remove(); del ax.tooltip
+                fig.canvas.draw_idle()
+
     win = tk.Toplevel(root)
     win.title("Sociograms")
     canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.mpl_connect('motion_notify_event', on_move)
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
+
 
 
 
@@ -471,6 +520,8 @@ def create_participant_panel(parent, participant_num):
 
 # --- Start simulation logic ---
 def start_simulation():
+    global last_sim_logs
+    last_sim_logs = []             # clear cache on each new sim run
     status_label.config(text="Status: Running")
     log_text.delete(1.0, tk.END)
 
@@ -490,6 +541,12 @@ def start_simulation():
         gaze_logs = generate_gaze_log(gaze_cluster)
         loc_logs = generate_location_log(loc_cluster)
         speak_logs = generate_speaking_log(speak_cluster)
+          # cache them for the sociogram
+        last_sim_logs.append({
+            "gaze":  gaze_logs,
+            "loc":   loc_logs,
+            "speak": speak_logs
+        })
 
         log_text.insert(tk.END, "\n[Gaze Log]\n" + "\n".join(gaze_logs) + "\n")
         log_text.insert(tk.END, "\n[Locomotion Log]\n" + "\n".join(loc_logs) + "\n")
