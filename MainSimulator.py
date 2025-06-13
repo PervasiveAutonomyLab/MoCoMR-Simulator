@@ -13,7 +13,8 @@ from numpy.random import multivariate_normal
 from scipy.stats import gaussian_kde
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch
-
+import itertools
+from networkx.algorithms import isomorphism
 
 
 last_sim_logs = []
@@ -156,6 +157,26 @@ def show_histograms_user():
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
 
+def parse_intervals(logs, pattern):
+    """
+    Parses a list of log strings to extract time intervals.
+    `pattern` should have two groups: timestamp string and duration in seconds.
+    Returns a list of (start_datetime, end_datetime) tuples.
+    """
+    intervals = []
+    for line in logs:
+        match = re.match(pattern, line)
+        if match:
+            ts_str, dur_str = match.groups()
+            try:
+                start = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                start = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
+            duration = float(dur_str)
+            end = start + timedelta(seconds=duration)
+            intervals.append((start, end))
+    return intervals
+
 def show_sociograms():
     # 1) Get selected clusters
     #loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
@@ -172,15 +193,6 @@ def show_sociograms():
     speak_logs_list = [p["speak"] for p in last_sim_logs]
 
     # 2) Helpers
-    def parse_intervals(logs, pattern, time_fmt="%Y-%m-%d %H:%M:%S"):
-        ivals = []
-        for line in logs:
-            m = re.match(pattern, line)
-            if not m: continue
-            ts, d = m.groups()
-            st = datetime.strptime(ts, time_fmt)
-            ivals.append((st, st + timedelta(seconds=float(d))))
-        return ivals
 
     def overlap(a, b):
         total = 0
@@ -316,6 +328,176 @@ def show_sociograms():
 
     win = tk.Toplevel(root)
     win.title("Sociograms")
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.mpl_connect('motion_notify_event', on_move)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+
+def show_actual_sociograms():
+    MAX_ROWS_PER_CLUSTER = 10
+
+    gaze_idxs  = [int(dd[0].get().split()[0]) - 1 for dd in participant_dropdowns]
+    loc_idxs   = [int(dd[1].get().split()[0]) - 1 for dd in participant_dropdowns]
+    speak_idxs = [int(dd[2].get().split()[0]) - 1 for dd in participant_dropdowns]
+
+    def parse_raw_intervals(df, cluster_idx, pattern, timestamp_col="Start Times", dur_col="Durations"):
+        df = df[df["Cluster_GMM"] == cluster_idx].head(MAX_ROWS_PER_CLUSTER)
+        df[timestamp_col] = df[timestamp_col].apply(ast.literal_eval)
+        df[dur_col] = df[dur_col].apply(ast.literal_eval)
+        intervals = []
+        for _, row in df.iterrows():
+            for ts, dur in zip(row[timestamp_col], row[dur_col]):
+                start = datetime.fromtimestamp(ts)
+                end = start + timedelta(seconds=dur)
+                intervals.append((start, end))
+        return intervals
+
+    def overlap(a, b):
+        total = 0
+        for s1, e1 in a:
+            for s2, e2 in b:
+                dt = (min(e1, e2) - max(s1, s2)).total_seconds()
+                if dt > 0:
+                    total += dt
+        return total
+
+    pos = {"P1": (0, 1), "P2": (1, 1), "P3": (0, 0), "P4": (1, 0)}
+    graphs, colors, titles = [], [], []
+
+    gaze_df = pd.read_csv("hover_gmm_user_clustering_results.csv")
+    fft_df = pd.read_csv("hover_user_object_fft.csv")
+    gaze_df["Cluster_GMM"] = pd.to_numeric(gaze_df["Cluster_GMM"], errors="coerce")
+    fft_df["Group ID"] = fft_df["Group ID"].astype(str)
+
+    G = nx.Graph(); G.add_nodes_from(pos)
+    gaze_intervals = []
+    for idx in gaze_idxs:
+        group_ids = gaze_df[gaze_df["Cluster_GMM"] == idx].head(MAX_ROWS_PER_CLUSTER)["Group ID"].unique()
+        durations = fft_df[fft_df["Group ID"].isin(group_ids)]["Mean Duration"].tolist()
+        base_time = datetime.now()
+        intervals = [(base_time + timedelta(seconds=i), base_time + timedelta(seconds=i+dur)) for i, dur in enumerate(durations)]
+        gaze_intervals.append(intervals)
+
+    for i in range(4):
+        for j in range(i + 1, 4):
+            w = overlap(gaze_intervals[i], gaze_intervals[j])
+            if w > 0:
+                G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
+    graphs.append(G); colors.append("blue"); titles.append("Actual Gaze Sociogram")
+
+    loc_df = pd.read_csv("loc_gmm_clustering_results.csv", low_memory=False)
+    loc_df["Cluster_GMM"] = pd.to_numeric(loc_df["Cluster_GMM"], errors="coerce")
+    loc_df["Timestamps"] = loc_df["Timestamps"].apply(ast.literal_eval)
+    loc_df["X"] = loc_df["X"].apply(ast.literal_eval)
+    loc_df["Y"] = loc_df["Y"].apply(ast.literal_eval)
+    loc_df["Z"] = loc_df["Z"].apply(ast.literal_eval)
+
+    G = nx.Graph(); G.add_nodes_from(pos)
+    loco_events = []
+    for idx in loc_idxs:
+        events = []
+        df = loc_df[loc_df["Cluster_GMM"] == idx].head(MAX_ROWS_PER_CLUSTER)
+        for _, row in df.iterrows():
+            ts, xs, ys, zs = row["Timestamps"], row["X"], row["Y"], row["Z"]
+            for i in range(1, len(ts)):
+                start = datetime.fromtimestamp(ts[i-1])
+                dur = ts[i] - ts[i-1]
+                position = np.array([xs[i], ys[i], zs[i]])
+                events.append((start, position, dur))
+        loco_events.append(events)
+
+    TH = 1.5
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if not loco_events[i] or not loco_events[j]:
+                continue
+            tot = 0.0
+            for ti, pi, dt in loco_events[i]:
+                tj, pj, _ = min(loco_events[j], key=lambda e: abs((e[0] - ti).total_seconds()))
+                if np.linalg.norm(pi - pj) <= TH:
+                    tot += dt
+            if tot > 0:
+                G.add_edge(f"P{i+1}", f"P{j+1}", weight=tot)
+    graphs.append(G); colors.append("green"); titles.append("Actual Locomotion Sociogram")
+
+    speak_df = pd.read_csv("gmm_clustering_results_speaking.csv")
+    speak_df["Cluster_GMM"] = pd.to_numeric(speak_df["Cluster_GMM"], errors="coerce")
+
+    G = nx.DiGraph(); G.add_nodes_from(pos)
+    speak_intervals = [
+        parse_raw_intervals(speak_df, idx, None)
+        for idx in speak_idxs
+    ]
+
+    for i in range(4):
+        for j in range(4):
+            if i == j:
+                continue
+            w = overlap(speak_intervals[i], speak_intervals[j])
+            if w > 0:
+                G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
+    graphs.append(G); colors.append("red"); titles.append("Actual Speaking Sociogram")
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    edge_artists, edge_weights = [], []
+
+    for ax, G, c, title in zip(axes, graphs, colors, titles):
+        ax.set_title(title); ax.axis("off")
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_size=600, node_color="lightblue")
+        nx.draw_networkx_labels(G, pos, ax=ax)
+
+        ws = [d["weight"] for _, _, d in G.edges(data=True)]
+        mx = max(ws) if ws else 1
+        arts, wts = [], []
+        for u, v, d in G.edges(data=True):
+            w = d["weight"]
+            width = 1 + 4 * (w / mx)
+            if title == "Actual Gaze Sociogram":
+                line = Line2D([pos[u][0], pos[v][0]],
+                              [pos[u][1], pos[v][1]],
+                              linewidth=width, color=c, picker=5)
+                ax.add_line(line)
+                arts.append(line)
+            else:
+                arr = FancyArrowPatch(pos[u], pos[v],
+                                      arrowstyle='-|>',
+                                      connectionstyle='arc3,rad=0.15',
+                                      mutation_scale=12,
+                                      linewidth=width, color=c,
+                                      picker=5)
+                ax.add_patch(arr)
+                arts.append(arr)
+            wts.append(w)
+        edge_artists.append(arts)
+        edge_weights.append(wts)
+
+    def on_move(event):
+        for ax, arts, wts in zip(axes, edge_artists, edge_weights):
+            if event.inaxes is not ax:
+                if hasattr(ax, 'tooltip'):
+                    ax.tooltip.remove(); del ax.tooltip
+                continue
+            hit = False
+            for art, w in zip(arts, wts):
+                cont, _ = art.contains(event)
+                if cont:
+                    if hasattr(ax, 'tooltip'):
+                        ax.tooltip.remove()
+                    ax.tooltip = ax.annotate(f"{w:.1f}s",
+                                             xy=(event.xdata, event.ydata),
+                                             xytext=(5, 5),
+                                             textcoords='offset points',
+                                             bbox=dict(boxstyle='round,pad=0.2',
+                                                       fc='yellow', alpha=0.7))
+                    fig.canvas.draw_idle()
+                    hit = True
+                    break
+            if not hit and hasattr(ax, 'tooltip'):
+                ax.tooltip.remove(); del ax.tooltip
+                fig.canvas.draw_idle()
+
+    win = tk.Toplevel(root)
+    win.title("Actual Sociograms")
     canvas = FigureCanvasTkAgg(fig, master=win)
     canvas.mpl_connect('motion_notify_event', on_move)
     canvas.draw()
@@ -462,6 +644,9 @@ def generate_gaze_log(cluster_idx):
 
     except Exception as e:
         return [f"Error generating gaze log: {e}"]
+
+
+
     
 
     
@@ -518,6 +703,73 @@ def create_participant_panel(parent, participant_num):
 
     return (gaze_dd, loc_dd, speak_dd)
 
+
+
+def merge_simulated_clusters(participant_dropdowns, last_sim_logs):
+    """
+    Merge user-input cluster config with simulated logs into a DataFrame.
+    Each participant gets their chosen cluster index and the actual logs generated.
+    """
+    data = []
+    for i, (dropdowns, logs) in enumerate(zip(participant_dropdowns, last_sim_logs), start=1):
+        gaze_idx = int(dropdowns[0].get().split()[0]) - 1
+        loc_idx = int(dropdowns[1].get().split()[0]) - 1
+        speak_idx = int(dropdowns[2].get().split()[0]) - 1
+
+        data.append({
+            "Group ID": i,
+            "Participant ID": i,
+            "Gaze Cluster": gaze_idx,
+            "Loc Cluster": loc_idx,
+            "Speaking Cluster": speak_idx,
+            "Gaze Log": logs["gaze"],
+            "Loc Log": logs["loc"],
+            "Speaking Log": logs["speak"]
+        })
+
+    df = pd.DataFrame(data)
+    df.to_csv("merged_simulated_cluster_config.csv", index=False)
+    return df
+
+def merge_raw_clusters_from_ui(participant_dropdowns):
+    """
+    Merge raw cluster information based on user-selected cluster IDs.
+    Pulls matching entries from the raw CSV files for all modalities.
+    """
+    gaze_idxs = [int(dd[0].get().split()[0]) - 1 for dd in participant_dropdowns]
+    loc_idxs = [int(dd[1].get().split()[0]) - 1 for dd in participant_dropdowns]
+    speak_idxs = [int(dd[2].get().split()[0]) - 1 for dd in participant_dropdowns]
+
+    # Load raw datasets
+    gaze_df = pd.read_csv("hover_gmm_user_clustering_results.csv")
+    loc_df = pd.read_csv("loc_gmm_clustering_results.csv", low_memory=False)
+    speak_df = pd.read_csv("gmm_clustering_results_speaking.csv")
+
+    gaze_df["Cluster_GMM"] = pd.to_numeric(gaze_df["Cluster_GMM"], errors="coerce")
+    loc_df["Cluster_GMM"] = pd.to_numeric(loc_df["Cluster_GMM"], errors="coerce")
+    speak_df["Cluster_GMM"] = pd.to_numeric(speak_df["Cluster_GMM"], errors="coerce")
+
+    rows = []
+    for i in range(4):
+        gaze_rows = gaze_df[gaze_df["Cluster_GMM"] == gaze_idxs[i]]
+        loc_rows = loc_df[loc_df["Cluster_GMM"] == loc_idxs[i]]
+        speak_rows = speak_df[speak_df["Cluster_GMM"] == speak_idxs[i]]
+
+        rows.append({
+            "Group ID": i+1,
+            "Participant ID": i+1,
+            "Gaze Cluster": gaze_idxs[i],
+            "Loc Cluster": loc_idxs[i],
+            "Speaking Cluster": speak_idxs[i],
+            "Gaze Raw Matches": len(gaze_rows),
+            "Loc Raw Matches": len(loc_rows),
+            "Speaking Raw Matches": len(speak_rows)
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv("merged_cluster_config.csv", index=False)
+    return df
+
 # --- Start simulation logic ---
 def start_simulation():
     global last_sim_logs
@@ -553,6 +805,8 @@ def start_simulation():
         log_text.insert(tk.END, "\n[Speaking Log]\n" + "\n".join(speak_logs) + "\n")
 
     log_text.see(tk.END)
+ 
+    
 
 def stop_simulation():
     status_label.config(text="Status: Stopped")
@@ -608,6 +862,10 @@ log_button.pack(pady=5)
 
 socio_button = ttk.Button(scrollable_control,text="Show Sociograms",command=show_sociograms)
 socio_button.pack(pady=5)
+
+actual_button = ttk.Button(scrollable_control, text="Show Actual Sociograms", command=show_actual_sociograms)
+actual_button.pack(pady=5)
+
 
 log_frame = ttk.Frame(main_frame)
 log_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
