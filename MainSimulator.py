@@ -15,9 +15,12 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch
 import itertools
 from networkx.algorithms import isomorphism
+from sklearn.metrics import jaccard_score
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 last_sim_logs = []
+
 
 
 def on_closing():
@@ -157,6 +160,62 @@ def show_histograms_user():
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
 
+def compare_graphs(G_real, G_sim):
+    real_edges = {(u, v): d["weight"] for u, v, d in G_real.edges(data=True)}
+    sim_edges = {(u, v): d["weight"] for u, v, d in G_sim.edges(data=True)}
+
+    all_edges = list(set(real_edges.keys()) | set(sim_edges.keys()))
+
+    vec_real = np.array([real_edges.get(e, 0.0) for e in all_edges])
+    vec_sim = np.array([sim_edges.get(e, 0.0) for e in all_edges])
+
+    if np.linalg.norm(vec_real) > 0:
+        vec_real = vec_real / np.linalg.norm(vec_real)
+    if np.linalg.norm(vec_sim) > 0:
+        vec_sim = vec_sim / np.linalg.norm(vec_sim)
+
+    cosine_sim = cosine_similarity([vec_real], [vec_sim])[0][0]
+    jaccard = jaccard_score(vec_real > 0, vec_sim > 0)
+    mean_diff = np.mean(np.abs(vec_real - vec_sim))
+    isomorphic = nx.is_isomorphic(G_real, G_sim)
+
+    return cosine_sim, jaccard, mean_diff, isomorphic
+
+def show_comparison_popup(results):
+    root = tk.Toplevel()
+    root.title("Sociogram Comparison Metrics")
+
+    tree = ttk.Treeview(root, columns=("Modality", "Jaccard", "Cosine", "Mean Δ Weight", "Isomorphic"), show="headings")
+    for col in tree["columns"]:
+        tree.heading(col, text=col)
+        tree.column(col, width=120)
+
+    for modality, (cosine, jaccard, diff, iso) in results.items():
+        tree.insert("", "end", values=(modality, f"{jaccard:.2f}", f"{cosine:.2f}", f"{diff:.2f}", str(iso)))
+
+    tree.pack(expand=True, fill="both")
+
+    return root
+
+def compute_numeric_comparison():
+    if not hasattr(root, "last_real_graphs") or not hasattr(root, "last_sim_graphs"):
+        tk.messagebox.showwarning("Graphs Missing", "Generate both real and simulated sociograms first.")
+        return
+
+    results = {}
+    for modality in ["Speaking", "Gaze", "Locomotion"]:
+        G_real = root.last_real_graphs.get(modality)
+        G_sim = root.last_sim_graphs.get(modality)
+        if G_real and G_sim and G_real.number_of_edges() and G_sim.number_of_edges():
+            results[modality] = compare_graphs(G_real, G_sim)
+
+    if results:
+        show_comparison_popup(results)
+    else:
+        tk.messagebox.showinfo("No Comparison", "Graphs are empty or mismatched.")
+
+
+
 def parse_intervals(logs, pattern):
     """
     Parses a list of log strings to extract time intervals.
@@ -179,9 +238,6 @@ def parse_intervals(logs, pattern):
 
 def show_sociograms():
     # 1) Get selected clusters
-    #loc_idxs   = [int(dd.get().split()[0]) - 1 for _, dd, _ in participant_dropdowns]
-    #speak_idxs = [int(dd.get().split()[0]) - 1 for _, _, dd in participant_dropdowns]
-    #gaze_idxs  = [int(dd.get().split()[0]) - 1 for dd, _, _ in participant_dropdowns]
 
     if not last_sim_logs:
         tk.messagebox.showwarning("No data", "Please run the simulation first.")
@@ -219,6 +275,7 @@ def show_sociograms():
             w = overlap(gaze_events[i], gaze_events[j])
             if w>0: G.add_edge(f"P{i+1}",f"P{j+1}", weight=w)
     graphs.append(G); colors.append("blue"); titles.append("Gaze Sociogram")
+    G_gaze_sim = G.copy()
 
     # Locomotion undirected)
     G = nx.Graph(); G.add_nodes_from(pos)
@@ -248,6 +305,7 @@ def show_sociograms():
                     tot+=dt
             if tot>0: G.add_edge(f"P{i+1}",f"P{j+1}", weight=tot)
     graphs.append(G); colors.append("green"); titles.append("Locomotion Sociogram")
+    G_loco_sim = G.copy()
 
     # Speaking (directed)
     G = nx.DiGraph(); G.add_nodes_from(pos)
@@ -261,6 +319,7 @@ def show_sociograms():
             w = overlap(speak_events[i], speak_events[j])
             if w>0: G.add_edge(f"P{i+1}",f"P{j+1}", weight=w)
     graphs.append(G); colors.append("red"); titles.append("Speaking Sociogram")
+    G_speaking_sim = G.copy()
 
     # 5) Plot & keep per-edge artists
     fig, axes = plt.subplots(1,3,figsize=(12,4))
@@ -298,7 +357,7 @@ def show_sociograms():
             wts.append(w)
 
         edge_artists.append(arts)
-        edge_weights.append(wts)
+        edge_weights.append(wts)   
 
     # 6) Hover tooltips
     def on_move(event):
@@ -332,6 +391,11 @@ def show_sociograms():
     canvas.mpl_connect('motion_notify_event', on_move)
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
+    root.last_sim_graphs = {
+    "Gaze": G_gaze_sim,
+    "Locomotion": G_loco_sim,
+    "Speaking": G_speaking_sim
+    } 
 
 def show_actual_sociograms():
     MAX_ROWS_PER_CLUSTER = 10
@@ -384,6 +448,7 @@ def show_actual_sociograms():
             if w > 0:
                 G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
     graphs.append(G); colors.append("blue"); titles.append("Actual Gaze Sociogram")
+    G_gaze_actual = G.copy()
 
     loc_df = pd.read_csv("loc_gmm_clustering_results.csv", low_memory=False)
     loc_df["Cluster_GMM"] = pd.to_numeric(loc_df["Cluster_GMM"], errors="coerce")
@@ -419,6 +484,7 @@ def show_actual_sociograms():
             if tot > 0:
                 G.add_edge(f"P{i+1}", f"P{j+1}", weight=tot)
     graphs.append(G); colors.append("green"); titles.append("Actual Locomotion Sociogram")
+    G_loco_actual = G.copy()
 
     speak_df = pd.read_csv("gmm_clustering_results_speaking.csv")
     speak_df["Cluster_GMM"] = pd.to_numeric(speak_df["Cluster_GMM"], errors="coerce")
@@ -437,6 +503,7 @@ def show_actual_sociograms():
             if w > 0:
                 G.add_edge(f"P{i+1}", f"P{j+1}", weight=w)
     graphs.append(G); colors.append("red"); titles.append("Actual Speaking Sociogram")
+    G_speak_actual = G.copy()
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     edge_artists, edge_weights = [], []
@@ -502,6 +569,11 @@ def show_actual_sociograms():
     canvas.mpl_connect('motion_notify_event', on_move)
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
+    root.last_real_graphs = {
+    "Speaking": G_speak_actual,
+    "Gaze": G_gaze_actual,
+    "Locomotion": G_loco_actual
+    }
 
 
 
@@ -865,6 +937,9 @@ socio_button.pack(pady=5)
 
 actual_button = ttk.Button(scrollable_control, text="Show Actual Sociograms", command=show_actual_sociograms)
 actual_button.pack(pady=5)
+
+compare_button = ttk.Button(scrollable_control, text="Compare Sociograms", command=compute_numeric_comparison)
+compare_button.pack(pady=5)
 
 
 log_frame = ttk.Frame(main_frame)
