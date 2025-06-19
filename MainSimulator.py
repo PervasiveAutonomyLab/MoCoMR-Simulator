@@ -17,10 +17,12 @@ import itertools
 from networkx.algorithms import isomorphism
 from sklearn.metrics import jaccard_score
 from sklearn.metrics.pairwise import cosine_similarity
-
+from scipy.stats import entropy
+import tkinter.messagebox as messagebox
 
 last_sim_logs = []
-
+raw_hist_durations = {"Gaze": [], "Locomotion": [], "Speaking": []}
+user_hist_durations = {"Gaze": [], "Locomotion": [], "Speaking": []}
 
 
 def on_closing():
@@ -86,6 +88,7 @@ def show_histograms_raw():
         for col, cluster_idx in enumerate(idxs):
             ax = axes[row, col]
             data = extractor(cluster_idx)
+            raw_hist_durations[row_labels[row]].extend(data.tolist())
             if data.size:
                 ax.hist(data, bins=20)
 
@@ -143,6 +146,8 @@ def show_histograms_user():
             # 3) plot exactly as before
             if durations:
                 ax.hist(durations, bins=20)
+            user_hist_durations[row_labels[row]].extend(durations)
+
 
             # axis‐label logic unchanged
             if col == 0:
@@ -159,6 +164,33 @@ def show_histograms_user():
     canvas = FigureCanvasTkAgg(fig, master=win)
     canvas.draw()
     canvas.get_tk_widget().pack(fill="both", expand=True)
+
+def compare_histograms_kl():
+    if not any(raw_hist_durations.values()) or not any(user_hist_durations.values()):
+        tk.messagebox.showwarning("Missing Data", "You must run both histogram views before comparing.")
+        return
+
+    results = []
+    for modality in ["Gaze", "Locomotion", "Speaking"]:
+        real = np.array(raw_hist_durations[modality])
+        sim  = np.array(user_hist_durations[modality])
+        if len(real) == 0 or len(sim) == 0:
+            results.append((modality, "N/A"))
+            continue
+        real_hist, _ = np.histogram(real, bins=20, range=(0, max(real.max(), sim.max()) + 1), density=True)
+        sim_hist, _  = np.histogram(sim,  bins=20, range=(0, max(real.max(), sim.max()) + 1), density=True)
+        real_hist += 1e-10  # Avoid divide by zero
+        sim_hist  += 1e-10
+        kld = entropy(real_hist, sim_hist)
+        results.append((modality, round(kld, 4)))
+
+    # Show results in popup
+    win = tk.Toplevel(root)
+    win.title("KL Divergence Comparison")
+    for i, (mod, score) in enumerate(results):
+        ttk.Label(win, text=f"{mod}:").grid(row=i, column=0, sticky="e", padx=10, pady=5)
+        ttk.Label(win, text=str(score)).grid(row=i, column=1, sticky="w", padx=10, pady=5)
+
 
 def compare_graphs(G_real, G_sim):
     real_edges = {(u, v): d["weight"] for u, v, d in G_real.edges(data=True)}
@@ -939,6 +971,9 @@ actual_button = ttk.Button(scrollable_control, text="Show Actual Sociograms", co
 actual_button.pack(pady=5)
 
 compare_button = ttk.Button(scrollable_control, text="Compare Sociograms", command=compute_numeric_comparison)
+compare_button.pack(pady=5)
+
+compare_button = ttk.Button(scrollable_control, text="Compare histograms", command=compare_histograms_kl)
 compare_button.pack(pady=5)
 
 
